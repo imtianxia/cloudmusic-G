@@ -49,8 +49,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${{ steps.v.outputs.tag }}"
-          gh release view "$tag" > /dev/null 2>&1 ||
-            gh release create "$tag" --draft --target "$GITHUB_SHA" \
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 ||
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" \
+              --draft --target "$GITHUB_SHA" \
               --title "MyGo 云音乐 ${{ steps.v.outputs.version }}" \
               --notes-file "$RUNNER_TEMP/notes.md"
 
@@ -100,7 +101,8 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           files=(dist/*/*.dmg dist/*/*-setup-*.exe dist/*/*.tar.gz dist/*/*.deb)
-          gh release upload "${{ needs.prepare.outputs.tag }}" "${files[@]}" --clobber
+          gh release upload "${{ needs.prepare.outputs.tag }}" "${files[@]}" --clobber \
+            --repo "${{ github.repository }}"
 
   publish:
     name: Publish
@@ -109,4 +111,4 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release edit "${{ needs.prepare.outputs.tag }}" --draft=false
+        run: gh release edit "${{ needs.prepare.outputs.tag }}" --draft=false --repo "${{ github.repository }}"
