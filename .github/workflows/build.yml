@@ -1,39 +1,62 @@
-# 云编译：在 fork 里一键构建 macOS / Windows / Linux 安装包，不需要任何 secrets。
+# 云编译 + 自动发 Release：Actions → Build & Release → Run workflow。
 #
-# 用法：
-#   1. Settings → Actions → General → Actions permissions → Allow all actions and
-#      reusable workflows → Save
-#   2. Actions 页顶部的 “I understand my workflows, go ahead and enable them”
-#   3. Actions → Build → Run workflow（分支选 main）→ 约 10 分钟
-#   4. 运行页底部 Artifacts：macOS / Windows / Linux 三个 zip
+# 流程：读 mygo.json 的 version → 建 draft release（tag = v<version>，notes 取 CHANGELOG
+#       里 "## <version>" 小节）→ 三平台编译并把安装包传进这个 draft → 全部成功后转正。
 #
-# 与仓库自带的 release.yml 的区别：
-#   * fork 里没有 Apple Developer ID 证书和更新签名私钥，所以这里按 ad-hoc 签名
-#     （-sign -）并且跳过公证（-skip-notarize）；release.yml 的 macOS job 会在
-#     “Import the certificate” 一步失败。
-#   * 不加 -upload：mygo.json 里 updates.github 指向上游 egoist/mygo-cloudmusic，
-#     fork 的 GITHUB_TOKEN 没有那边权限。产物只进 Actions artifacts，打 tag 时
-#     额外塞进本仓库的 draft Release。
-#   * mygo 不需要 cgo，所以 Windows / Linux 的产物在 ubuntu-latest 上交叉编译，
-#     和上游 release.yml 完全一样的命令。
+# fork 里没有 Apple Developer ID 证书和更新私钥，所以 macOS 走 ad-hoc 签名（-sign -）、
+# 不公证（-skip-notarize），也不产 update-*.json；安装包能装，首次打开要右键 → 打开。
+# 发新版本：改 mygo.json 的 version，在 CHANGELOG.md 加同名 "## x.y.z" 小节，再点 Run workflow。
 
-name: Build
+name: Build & Release
 
 on:
   workflow_dispatch:
-  push:
-    tags: ["v*"]
 
 permissions:
-  contents: write # 打 tag 时创建 draft release 并上传安装包
+  contents: write
 
 concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
+  group: release
+  cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: v
+        run: |
+          version=$(jq -r .version mygo.json)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Take the notes from the changelog
+        run: |
+          awk -v heading="## ${{ steps.v.outputs.version }}" '
+            /^## / { inside = ($0 == heading); next }
+            inside
+          ' CHANGELOG.md | sed '/./,$!d' > "$RUNNER_TEMP/notes.md"
+          test -s "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ steps.v.outputs.tag }}"
+          gh release view "$tag" > /dev/null 2>&1 ||
+            gh release create "$tag" --draft --target "$GITHUB_SHA" \
+              --title "MyGo 云音乐 ${{ steps.v.outputs.version }}" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+
   build:
     name: ${{ matrix.name }}
+    needs: prepare
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -50,7 +73,7 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # <slug>-setup-<version>-<arch>.exe 由 NSIS 生成，上游也是这么装的
+      # <slug>-setup-<version>-<arch>.exe 由 NSIS 生成
       - name: Install NSIS, for the Windows installers
         if: matrix.name == 'Windows'
         run: sudo apt-get update && sudo apt-get install -y nsis
@@ -70,19 +93,20 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-      - name: Upload to the draft release of the tag
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Upload the installers to the draft release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
-            # 三个 job 同时到达时，抢先的那个可能已经建好了
-            gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
-              --title "$GITHUB_REF_NAME" --generate-notes || true
-          fi
           shopt -s nullglob
           files=(dist/*/*.dmg dist/*/*-setup-*.exe dist/*/*.tar.gz dist/*/*.deb)
-          if [ ${#files[@]} -gt 0 ]; then
-            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
-          fi
+          gh release upload "${{ needs.prepare.outputs.tag }}" "${files[@]}" --clobber
+
+  publish:
+    name: Publish
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "${{ needs.prepare.outputs.tag }}" --draft=false
