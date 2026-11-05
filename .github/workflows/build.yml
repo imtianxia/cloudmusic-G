@@ -1,0 +1,88 @@
+# 云编译：在 fork 里一键构建 macOS / Windows / Linux 安装包，不需要任何 secrets。
+#
+# 用法：
+#   1. Settings → Actions → General → Actions permissions → Allow all actions and
+#      reusable workflows → Save
+#   2. Actions 页顶部的 “I understand my workflows, go ahead and enable them”
+#   3. Actions → Build → Run workflow（分支选 main）→ 约 10 分钟
+#   4. 运行页底部 Artifacts：macOS / Windows / Linux 三个 zip
+#
+# 与仓库自带的 release.yml 的区别：
+#   * fork 里没有 Apple Developer ID 证书和更新签名私钥，所以这里按 ad-hoc 签名
+#     （-sign -）并且跳过公证（-skip-notarize）；release.yml 的 macOS job 会在
+#     “Import the certificate” 一步失败。
+#   * 不加 -upload：mygo.json 里 updates.github 指向上游 egoist/mygo-cloudmusic，
+#     fork 的 GITHUB_TOKEN 没有那边权限。产物只进 Actions artifacts，打 tag 时
+#     额外塞进本仓库的 draft Release。
+#   * mygo 不需要 cgo，所以 Windows / Linux 的产物在 ubuntu-latest 上交叉编译，
+#     和上游 release.yml 完全一样的命令。
+
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # 打 tag 时创建 draft release 并上传安装包
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macOS, os: macos-latest, platform: "darwin/arm64,darwin/amd64" }
+          - { name: Windows, os: ubuntu-latest, platform: "windows/amd64,windows/arm64" }
+          - { name: Linux, os: ubuntu-latest, platform: "linux/amd64,linux/arm64" }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # <slug>-setup-<version>-<arch>.exe 由 NSIS 生成，上游也是这么装的
+      - name: Install NSIS, for the Windows installers
+        if: matrix.name == 'Windows'
+        run: sudo apt-get update && sudo apt-get install -y nsis
+
+      - name: Build
+        run: >-
+          go tool mygo build
+          -platform "${{ matrix.platform }}"
+          -o dist
+          -sign -
+          -skip-notarize
+
+      - name: Upload the artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
+
+      - name: Upload to the draft release of the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            # 三个 job 同时到达时，抢先的那个可能已经建好了
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag \
+              --title "$GITHUB_REF_NAME" --generate-notes || true
+          fi
+          shopt -s nullglob
+          files=(dist/*/*.dmg dist/*/*-setup-*.exe dist/*/*.tar.gz dist/*/*.deb)
+          if [ ${#files[@]} -gt 0 ]; then
+            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+          fi
